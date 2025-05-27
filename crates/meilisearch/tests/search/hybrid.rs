@@ -625,3 +625,137 @@ async fn retrieve_vectors() {
     ]
     "###);
 }
+
+#[actix_rt::test]
+async fn test_distinct_filtering_with_federated_search() {
+    let server = Server::new().await;
+    
+    // Create two indexes
+    let products_index = server.index("products");
+    let categories_index = server.index("categories");
+
+    // Set up embedder for both indexes
+    for index in [&products_index, &categories_index] {
+        let (response, code) = index
+            .update_settings(json!({ 
+                "embedders": {
+                    "default": {
+                        "source": "userProvided",
+                        "dimensions": 2
+                    }
+                }
+            }))
+            .await;
+        assert_eq!(202, code);
+        index.wait_task(response.uid()).await.succeeded();
+    }
+
+    // Add documents to products index
+    let products_documents = json!([
+        {
+            "id": 1,
+            "title": "Red Nike Shoes",
+            "product_id": "ABC123",
+            "_vectors": {"default": [0.1, 0.1]}
+        }
+    ]);
+
+    let (response, code) = products_index.add_documents(products_documents, Some("id")).await;
+    assert_eq!(202, code);
+    products_index.wait_task(response.uid()).await.succeeded();
+
+    // Add documents to categories index
+    let categories_documents = json!([
+        {
+            "id": 1,
+            "name": "Nike Shoes",
+            "category_id": "ABC123",  // Same ID as the product!
+            "_vectors": {"default": [0.9, 0.9]}
+        }
+    ]);
+
+    let (response, code) = categories_index.add_documents(categories_documents, Some("id")).await;
+    assert_eq!(202, code);
+    categories_index.wait_task(response.uid()).await.succeeded();
+
+    // Set distinct attributes for both indexes
+    for index in [&products_index, &categories_index] {
+        let (task, _) = index.update_distinct_attribute(json!("product_id")).await;
+        index.wait_task(task.uid()).await.succeeded();
+    }
+
+    // Perform federated search
+    let (response, code) = server
+        .multi_search(json!({
+            "federation": {},  // Enable federation
+            "queries": [
+                {
+                    "indexUid": "products",
+                    "q": "red shoes",
+                    "vector": [0.9, 0.9],
+                    "hybrid": {
+                        "embedder": "default",
+                        "semanticRatio": 0.5
+                    }
+                },
+                {
+                    "indexUid": "categories",
+                    "q": "red shoes",
+                    "vector": [0.9, 0.9],
+                    "hybrid": {
+                        "embedder": "default",
+                        "semanticRatio": 0.5
+                    }
+                }
+            ]
+        }))
+        .await;
+    assert_eq!(200, code);
+    
+    // Check results from federated search
+    let hits = response["hits"].as_array().unwrap();
+    
+    println!("\nFEDERATED SEARCH RESULTS:");
+    for (i, hit) in hits.iter().enumerate() {
+        println!("  {}. id={}, index={}, federation={}", 
+                i+1, 
+                hit["id"], 
+                hit["_federation"]["indexUid"],
+                hit["_federation"]);
+    }
+    
+    // Collect all distinct values
+    let mut all_distinct_values = Vec::new();
+    
+    // Add product_ids from products index
+    for hit in hits {
+        if let Some(product_id) = hit["product_id"].as_str() {
+            all_distinct_values.push(product_id);
+        }
+        if let Some(category_id) = hit["category_id"].as_str() {
+            all_distinct_values.push(category_id);
+        }
+    }
+    
+    let unique_distinct_values: std::collections::HashSet<_> = all_distinct_values.iter().collect();
+    
+    println!("\nTotal results: {}, Unique distinct values: {}", 
+             all_distinct_values.len(), 
+             unique_distinct_values.len());
+    println!("Distinct values found: {:?}", all_distinct_values);
+    
+    // The bug would manifest as having more results than unique distinct values
+    if all_distinct_values.len() > unique_distinct_values.len() {
+        panic!("BUG REPRODUCED! Federated search returned {} documents but only {} unique distinct values. \
+               This proves distinct filtering is not applied after merging results from different indexes. \
+               Distinct values: {:?}", 
+               all_distinct_values.len(), 
+               unique_distinct_values.len(), 
+               all_distinct_values);
+    }
+    
+    println!("\nTest completed. Expected 1 unique distinct value, got {}", unique_distinct_values.len());
+    if unique_distinct_values.len() == 1 {
+        println!("Distinct filtering appears to be working correctly in this version");
+    }
+}
