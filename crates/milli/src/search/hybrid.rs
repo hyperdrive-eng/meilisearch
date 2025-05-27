@@ -5,7 +5,8 @@ use roaring::RoaringBitmap;
 
 use crate::score_details::{ScoreDetails, ScoreValue, ScoringStrategy};
 use crate::search::SemanticSearch;
-use crate::{MatchingWords, Result, Search, SearchResult};
+use crate::search::new::distinct::apply_distinct_rule;
+use crate::{MatchingWords, Result, Search, SearchResult, SearchContext};
 
 struct ScoreWithRatioResult {
     matching_words: MatchingWords,
@@ -89,9 +90,10 @@ impl ScoreWithRatioResult {
     fn merge(
         vector_results: Self,
         keyword_results: Self,
+        search: &Search<'_>,
         from: usize,
         length: usize,
-    ) -> (SearchResult, u32) {
+    ) -> Result<(SearchResult, u32)> {
         #[derive(Clone, Copy)]
         enum ResultSource {
             Semantic,
@@ -123,10 +125,6 @@ impl ScoreWithRatioResult {
             )
             // remove documents we already saw
             .filter(|((docid, _), _)| documents_seen.insert(*docid))
-            // start skipping **after** the filter
-            .skip(from)
-            // take **after** skipping
-            .take(length)
         {
             if let ResultSource::Semantic = source {
                 semantic_hit_count += 1;
@@ -136,18 +134,59 @@ impl ScoreWithRatioResult {
             document_scores.push(main_score);
         }
 
-        (
-            SearchResult {
-                matching_words: keyword_results.matching_words,
-                candidates: vector_results.candidates | keyword_results.candidates,
-                documents_ids,
-                document_scores,
-                degraded: vector_results.degraded | keyword_results.degraded,
-                used_negative_operator: vector_results.used_negative_operator
-                    | keyword_results.used_negative_operator,
-            },
-            semantic_hit_count,
-        )
+        let mut final_result = SearchResult {
+            matching_words: keyword_results.matching_words,
+            candidates: vector_results.candidates | keyword_results.candidates,
+            documents_ids,
+            document_scores,
+            degraded: vector_results.degraded | keyword_results.degraded,
+            used_negative_operator: vector_results.used_negative_operator
+                | keyword_results.used_negative_operator,
+        };
+
+        // Apply distinct rule if a distinct field is configured, similar to bucket_sort
+        let distinct_field = match search.distinct.as_deref() {
+            Some(distinct) => Some(distinct),
+            None => search.index.distinct_field(search.rtxn)?,
+        };
+
+        if let Some(f) = distinct_field {
+            let fields_ids_map = search.index.fields_ids_map(search.rtxn)?;
+            if let Some(distinct_fid) = fields_ids_map.id(f) {
+                let mut ctx = SearchContext::new(search.index, search.rtxn)?;
+                let all_candidates: RoaringBitmap = final_result.documents_ids.iter().copied().collect();
+                let remaining_candidates = apply_distinct_rule(&mut ctx, distinct_fid, &all_candidates)?
+                    .remaining;
+                
+                // Filter documents_ids and document_scores to only include remaining candidates
+                let mut filtered_docs = Vec::new();
+                let mut filtered_scores = Vec::new();
+                for (i, &docid) in final_result.documents_ids.iter().enumerate() {
+                    if remaining_candidates.contains(docid) {
+                        filtered_docs.push(docid);
+                        filtered_scores.push(final_result.document_scores[i].clone());
+                    }
+                }
+                final_result.documents_ids = filtered_docs;
+                final_result.document_scores = filtered_scores;
+            }
+        }
+
+        // Apply offset and limit after distinct filtering
+        let (documents_ids, document_scores) = if from >= final_result.documents_ids.len() {
+            (vec![], vec![])
+        } else {
+            let end = std::cmp::min(from + length, final_result.documents_ids.len());
+            (
+                final_result.documents_ids[from..end].to_vec(),
+                final_result.document_scores[from..end].to_vec(),
+            )
+        };
+
+        final_result.documents_ids = documents_ids;
+        final_result.document_scores = document_scores;
+
+        Ok((final_result, semantic_hit_count))
     }
 }
 
@@ -227,7 +266,7 @@ impl Search<'_> {
         let vector_results = ScoreWithRatioResult::new(vector_results, semantic_ratio);
 
         let (merge_results, semantic_hit_count) =
-            ScoreWithRatioResult::merge(vector_results, keyword_results, self.offset, self.limit);
+            ScoreWithRatioResult::merge(vector_results, keyword_results, self, self.offset, self.limit)?;
         assert!(merge_results.documents_ids.len() <= self.limit);
         Ok((merge_results, Some(semantic_hit_count)))
     }
