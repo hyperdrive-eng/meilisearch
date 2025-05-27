@@ -2,7 +2,7 @@ use meili_snap::snapshot;
 use once_cell::sync::Lazy;
 
 use crate::common::index::Index;
-use crate::common::{Server, Value};
+use crate::common::{GetAllDocumentsOptions, Server, Value};
 use crate::json;
 
 async fn index_with_documents_user_provided<'a>(
@@ -1036,6 +1036,14 @@ async fn test_hybrid_merge_distinct_bug_confirmation() {
     let (response, code) = index.add_documents(test_documents, Some("id")).await;
     assert_eq!(202, code);
     index.wait_task(response.uid()).await.succeeded();
+    let (documents, code) = index.get_all_documents(GetAllDocumentsOptions { 
+        limit: None,
+        offset: None,
+        fields: None,
+        retrieve_vectors: true 
+    }).await;
+    assert_eq!(200, code);
+    println!("[Arthur] CURRENT DOCUMENTS:\n{}", serde_json::to_string_pretty(&documents).unwrap());
 
     // Set distinct on product_id
     let (task, _) = index.update_distinct_attribute(json!("product_id")).await;
