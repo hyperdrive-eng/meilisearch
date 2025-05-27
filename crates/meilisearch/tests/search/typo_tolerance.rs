@@ -58,4 +58,4 @@ async fn test_typo_tolerance_with_wildcard_searchable_attributes() {
         assert_eq!(response["hits"].as_array().unwrap().len(), 1);
         assert_eq!(response["hits"][0]["id"], 2);
     }).await;
-}
+} 
