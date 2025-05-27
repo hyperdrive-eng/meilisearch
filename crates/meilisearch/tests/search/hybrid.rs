@@ -920,6 +920,7 @@ async fn test_distinct_bug_with_semantic_ratio_extremes() {
     }
     
     // Now try with equal weighting
+    
     let (response, code) = index
         .search_post(json!({
             "q": "amazing fantastic super best quality nike shoes",
@@ -983,93 +984,88 @@ async fn test_hybrid_merge_distinct_bug_confirmation() {
     assert_eq!(202, code);
     index.wait_task(response.uid()).await.succeeded();
 
-    // Create 6 documents with 3 different distinct values
-    // We want both search types to return documents, then merge should apply distinct filtering
+    // Create documents with more extreme differences in search scores
     let test_documents = json!([
         // Group 1: product_a
         {
             "id": 1,
-            "title": "FIRST MATCHING TERMS QUERY SEARCH",  // High keyword relevance
-            "description": "unrelated vector content",
+            "title": "EXACT MATCH KEYWORD SEARCH TERMS HERE",  // Perfect keyword match
+            "description": "completely unrelated vector content",
             "product_id": "product_a",
-            "_vectors": {"default": [0.1, 0.1, 0.1, 0.1]}  // Low vector relevance
+            "_vectors": {"default": [0.0, 0.0, 0.0, 0.0]}  // Minimum vector similarity
         },
         {
             "id": 2,
-            "title": "different unrelated content",  // Low keyword relevance
-            "description": "but high vector similarity here",
+            "title": "completely different text",  // No keyword match
+            "description": "but perfect vector match",
             "product_id": "product_a",  // SAME distinct value
-            "_vectors": {"default": [0.9, 0.9, 0.9, 0.9]}  // High vector relevance
+            "_vectors": {"default": [1.0, 1.0, 1.0, 1.0]}  // Maximum vector similarity
         },
         // Group 2: product_b  
         {
             "id": 3,
-            "title": "SECOND MATCHING TERMS QUERY SEARCH",
-            "description": "another keyword match",
+            "title": "EXACT MATCH KEYWORD SEARCH TERMS HERE",
+            "description": "unrelated vector content",
             "product_id": "product_b",
-            "_vectors": {"default": [0.2, 0.2, 0.2, 0.2]}
+            "_vectors": {"default": [0.0, 0.0, 0.0, 0.0]}
         },
         {
             "id": 4,
-            "title": "random stuff here",
-            "description": "high vector match content",
-            "product_id": "product_b",  // SAME distinct value
-            "_vectors": {"default": [0.8, 0.8, 0.8, 0.8]}
+            "title": "different text entirely",
+            "description": "perfect vector match",
+            "product_id": "product_b",
+            "_vectors": {"default": [1.0, 1.0, 1.0, 1.0]}
         },
         // Group 3: product_c
         {
             "id": 5,
-            "title": "THIRD MATCHING TERMS QUERY SEARCH",
-            "description": "keyword relevance here",
+            "title": "EXACT MATCH KEYWORD SEARCH TERMS HERE",
+            "description": "no vector relevance",
             "product_id": "product_c",
-            "_vectors": {"default": [0.3, 0.3, 0.3, 0.3]}
+            "_vectors": {"default": [0.0, 0.0, 0.0, 0.0]}
         },
         {
             "id": 6,
-            "title": "unrelated keyword text",
-            "description": "but vector similarity",
-            "product_id": "product_c",  // SAME distinct value
-            "_vectors": {"default": [0.7, 0.7, 0.7, 0.7]}
+            "title": "unrelated text",
+            "description": "maximum vector similarity",
+            "product_id": "product_c",
+            "_vectors": {"default": [1.0, 1.0, 1.0, 1.0]}
         }
     ]);
 
     let (response, code) = index.add_documents(test_documents, Some("id")).await;
     assert_eq!(202, code);
     index.wait_task(response.uid()).await.succeeded();
-    let (documents, code) = index.get_all_documents(GetAllDocumentsOptions { 
-        limit: None,
-        offset: None,
-        fields: None,
-        retrieve_vectors: true 
-    }).await;
-    assert_eq!(200, code);
-    println!("[Arthur] CURRENT DOCUMENTS:\n{}", serde_json::to_string_pretty(&documents).unwrap());
 
     // Set distinct on product_id
     let (task, _) = index.update_distinct_attribute(json!("product_id")).await;
     index.wait_task(task.uid()).await.succeeded();
 
-    // Perform hybrid search that should match multiple documents
+    // Perform hybrid search with extreme semantic ratio to force both search types
     let (response, code) = index
         .search_post(json!({
-            "q": "MATCHING TERMS QUERY SEARCH",  // Should match docs 1, 3, 5 well
-            "vector": [0.8, 0.8, 0.8, 0.8],     // Should match docs 2, 4, 6 well
+            "q": "EXACT MATCH KEYWORD SEARCH TERMS HERE",  // Perfect match for keyword docs
+            "vector": [1.0, 1.0, 1.0, 1.0],     // Perfect match for vector docs
             "hybrid": {
                 "embedder": "default", 
-                "semanticRatio": 0.5  // Equal weight
+                "semanticRatio": 0.5  // Equal weight to maximize chance of both appearing
             },
-            "limit": 10
+            "limit": 10,
+            "showRankingScore": true  // Add ranking scores to debug
         }))
         .await;
 
     assert_eq!(200, code);
     let hits = response["hits"].as_array().unwrap();
     
-    println!("HYBRID SEARCH RESULTS (limit=10):");
+    println!("\nHYBRID SEARCH RESULTS (limit=10):");
     for (i, hit) in hits.iter().enumerate() {
-        println!("  {}. id={}, product_id={}, title={}", 
-                i+1, hit["id"], hit["product_id"], 
-                hit["title"].as_str().unwrap_or("").chars().take(30).collect::<String>());
+        println!("  {}. id={}, product_id={}, title={}, ranking_score={}", 
+                i+1, 
+                hit["id"], 
+                hit["product_id"], 
+                hit["title"].as_str().unwrap_or("").chars().take(30).collect::<String>(),
+                hit["_rankingScore"]);
     }
     
     // Count distinct values
@@ -1079,7 +1075,7 @@ async fn test_hybrid_merge_distinct_bug_confirmation() {
     
     let unique_product_ids: std::collections::HashSet<_> = product_ids.iter().collect();
     
-    println!("Total results: {}, Unique product_ids: {}", product_ids.len(), unique_product_ids.len());
+    println!("\nTotal results: {}, Unique product_ids: {}", product_ids.len(), unique_product_ids.len());
     println!("Product IDs found: {:?}", product_ids);
     
     // The bug would manifest as having more results than unique distinct values
@@ -1089,8 +1085,214 @@ async fn test_hybrid_merge_distinct_bug_confirmation() {
                Product IDs: {:?}", product_ids.len(), unique_product_ids.len(), product_ids);
     }
     
-    println!("Test completed. Expected up to 3 results (one per distinct value), got {}", hits.len());
+    println!("\nTest completed. Expected up to 3 results (one per distinct value), got {}", hits.len());
     if hits.len() <= 3 {
+        println!("Distinct filtering appears to be working correctly in this version");
+    }
+}
+
+// New test: test_hybrid_merge_distinct_bug_single_product
+#[actix_rt::test]
+async fn test_hybrid_merge_distinct_bug_single_product() {
+    let server = Server::new().await;
+    let index = server.index("test");
+
+    // Set up embedder
+    let (response, code) = index
+        .update_settings(json!({ 
+            "embedders": {
+                "default": {
+                    "source": "userProvided",
+                    "dimensions": 4
+                }
+            }
+        }))
+        .await;
+    assert_eq!(202, code);
+    index.wait_task(response.uid()).await.succeeded();
+
+    // Only two documents, same product_id
+    let test_documents = json!([
+        {
+            "id": 1,
+            "title": "EXACT MATCH KEYWORD SEARCH TERMS HERE",  // Perfect keyword match
+            "description": "completely unrelated vector content",
+            "product_id": "product_a",
+            "_vectors": {"default": [0.0, 0.0, 0.0, 0.0]}  // Minimum vector similarity
+        },
+        {
+            "id": 2,
+            "title": "completely different text",  // No keyword match
+            "description": "but perfect vector match",
+            "product_id": "product_a",  // SAME distinct value
+            "_vectors": {"default": [1.0, 1.0, 1.0, 1.0]}  // Maximum vector similarity
+        }
+    ]);
+
+    let (response, code) = index.add_documents(test_documents, Some("id")).await;
+    assert_eq!(202, code);
+    index.wait_task(response.uid()).await.succeeded();
+
+    // Set distinct on product_id
+    let (task, _) = index.update_distinct_attribute(json!("product_id")).await;
+    index.wait_task(task.uid()).await.succeeded();
+
+    // Perform hybrid search with limit=2
+    let (response, code) = index
+        .search_post(json!({
+            "q": "EXACT MATCH KEYWORD SEARCH TERMS HERE",  // Perfect match for keyword doc
+            "vector": [1.0, 1.0, 1.0, 1.0],     // Perfect match for vector doc
+            "hybrid": {
+                "embedder": "default", 
+                "semanticRatio": 0.5  // Equal weight
+            },
+            "limit": 2,
+            "showRankingScore": true
+        }))
+        .await;
+
+    assert_eq!(200, code);
+    let hits = response["hits"].as_array().unwrap();
+    
+    println!("\nHYBRID SEARCH RESULTS (limit=2):");
+    for (i, hit) in hits.iter().enumerate() {
+        println!("  {}. id={}, product_id={}, title={}, ranking_score={}", 
+                i+1, 
+                hit["id"], 
+                hit["product_id"], 
+                hit["title"].as_str().unwrap_or("").chars().take(30).collect::<String>(),
+                hit["_rankingScore"]);
+    }
+    
+    // Count distinct values
+    let product_ids: Vec<&str> = hits.iter()
+        .filter_map(|hit| hit["product_id"].as_str())
+        .collect();
+    
+    let unique_product_ids: std::collections::HashSet<_> = product_ids.iter().collect();
+    
+    println!("\nTotal results: {}, Unique product_ids: {}", product_ids.len(), unique_product_ids.len());
+    println!("Product IDs found: {:?}", product_ids);
+    
+    // The bug would manifest as having more results than unique distinct values
+    if product_ids.len() > unique_product_ids.len() {
+        panic!("BUG REPRODUCED! Hybrid search returned {} documents but only {} unique distinct values. \
+               This proves distinct filtering is not applied after merging vector and keyword results. \
+               Product IDs: {:?}", product_ids.len(), unique_product_ids.len(), product_ids);
+    }
+    
+    println!("\nTest completed. Expected 1 result (one per distinct value), got {}", hits.len());
+    if hits.len() == 1 {
+        println!("Distinct filtering appears to be working correctly in this version");
+    }
+}
+
+// New test: test_hybrid_merge_distinct_bug_multiple_products
+#[actix_rt::test]
+async fn test_hybrid_merge_distinct_bug_multiple_products() {
+    let server = Server::new().await;
+    let index = server.index("test");
+
+    // Set up embedder
+    let (response, code) = index
+        .update_settings(json!({ 
+            "embedders": {
+                "default": {
+                    "source": "userProvided",
+                    "dimensions": 4
+                }
+            }
+        }))
+        .await;
+    assert_eq!(202, code);
+    index.wait_task(response.uid()).await.succeeded();
+
+    // Four documents: two pairs with different product_ids
+    let test_documents = json!([
+        {
+            "id": 1,
+            "title": "EXACT MATCH KEYWORD SEARCH TERMS HERE",  // Perfect keyword match
+            "description": "completely unrelated vector content",
+            "product_id": "product_a",
+            "_vectors": {"default": [0.0, 0.0, 0.0, 0.0]}  // Minimum vector similarity
+        },
+        {
+            "id": 2,
+            "title": "completely different text",  // No keyword match
+            "description": "but perfect vector match",
+            "product_id": "product_a",  // SAME distinct value
+            "_vectors": {"default": [1.0, 1.0, 1.0, 1.0]}  // Maximum vector similarity
+        },
+        {
+            "id": 3,
+            "title": "EXACT MATCH KEYWORD SEARCH TERMS HERE",  // Perfect keyword match
+            "description": "unrelated vector content",
+            "product_id": "product_b",
+            "_vectors": {"default": [0.0, 0.0, 0.0, 0.0]}
+        },
+        {
+            "id": 4,
+            "title": "different text entirely",  // No keyword match
+            "description": "perfect vector match",
+            "product_id": "product_b",  // SAME distinct value
+            "_vectors": {"default": [1.0, 1.0, 1.0, 1.0]}
+        }
+    ]);
+
+    let (response, code) = index.add_documents(test_documents, Some("id")).await;
+    assert_eq!(202, code);
+    index.wait_task(response.uid()).await.succeeded();
+
+    // Set distinct on product_id
+    let (task, _) = index.update_distinct_attribute(json!("product_id")).await;
+    index.wait_task(task.uid()).await.succeeded();
+
+    // Perform hybrid search with limit=4
+    let (response, code) = index
+        .search_post(json!({
+            "q": "EXACT MATCH KEYWORD SEARCH TERMS HERE",  // Perfect match for keyword docs
+            "vector": [1.0, 1.0, 1.0, 1.0],     // Perfect match for vector docs
+            "hybrid": {
+                "embedder": "default", 
+                "semanticRatio": 0.5  // Equal weight
+            },
+            "limit": 4,
+            "showRankingScore": true
+        }))
+        .await;
+
+    assert_eq!(200, code);
+    let hits = response["hits"].as_array().unwrap();
+    
+    println!("\nHYBRID SEARCH RESULTS (limit=4):");
+    for (i, hit) in hits.iter().enumerate() {
+        println!("  {}. id={}, product_id={}, title={}, ranking_score={}", 
+                i+1, 
+                hit["id"], 
+                hit["product_id"], 
+                hit["title"].as_str().unwrap_or("").chars().take(30).collect::<String>(),
+                hit["_rankingScore"]);
+    }
+    
+    // Count distinct values
+    let product_ids: Vec<&str> = hits.iter()
+        .filter_map(|hit| hit["product_id"].as_str())
+        .collect();
+    
+    let unique_product_ids: std::collections::HashSet<_> = product_ids.iter().collect();
+    
+    println!("\nTotal results: {}, Unique product_ids: {}", product_ids.len(), unique_product_ids.len());
+    println!("Product IDs found: {:?}", product_ids);
+    
+    // The bug would manifest as having more results than unique distinct values
+    if product_ids.len() > unique_product_ids.len() {
+        panic!("BUG REPRODUCED! Hybrid search returned {} documents but only {} unique distinct values. \
+               This proves distinct filtering is not applied after merging vector and keyword results. \
+               Product IDs: {:?}", product_ids.len(), unique_product_ids.len(), product_ids);
+    }
+    
+    println!("\nTest completed. Expected 2 results (one per distinct value), got {}", hits.len());
+    if hits.len() == 2 {
         println!("Distinct filtering appears to be working correctly in this version");
     }
 }
