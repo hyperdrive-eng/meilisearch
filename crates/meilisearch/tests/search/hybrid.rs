@@ -634,13 +634,13 @@ async fn test_hybrid_search_distinct_bug_reproduction() {
     let server = Server::new().await;
     let index = server.index("test");
 
-    // Set up embedder
+    // Set up embedder with higher dimensions for more extreme differences
     let (response, code) = index
         .update_settings(json!({ 
             "embedders": {
                 "default": {
                     "source": "userProvided",
-                    "dimensions": 2
+                    "dimensions": 8  // Increased from 2 to 8 dimensions
                 }
             }
         }))
@@ -648,33 +648,33 @@ async fn test_hybrid_search_distinct_bug_reproduction() {
     assert_eq!(202, code);
     index.wait_task(response.uid()).await.succeeded();
 
-    // Create documents designed to trigger the bug:
-    // - Same product_id but very different content that will rank differently
-    // - Ensure one ranks high in keyword search, other in vector search
+    // Create documents with extreme differences:
+    // - Completely different content for keyword vs vector optimization
+    // - More extreme vector differences using 8D space
     let test_documents = json!([
         {
             "id": 1,
-            "title": "NIKE SPORTS JACKET LEATHER RED",  // High keyword match
+            "title": "red nike running shoes athletic footwear",  // Strong keyword match
             "brand": "Nike", 
-            "product_id": "SAME_PRODUCT",
+            "product_id": "DUPLICATE_ID",
             "category": "sports",
-            "_vectors": {"default": [0.1, 0.1]}  // Low vector similarity
+            "_vectors": {"default": [-1.0, -1.0, -1.0, -1.0, -1.0, -1.0, -1.0, -1.0]}  // Extreme low similarity
         },
         {
             "id": 2,
-            "title": "Blue casual wear item", // Low keyword match
-            "brand": "Nike",
-            "product_id": "SAME_PRODUCT", // SAME product_id!
+            "title": "blue adidas casual shirt clothing apparel", // Completely different keywords
+            "brand": "Adidas",
+            "product_id": "DUPLICATE_ID", // SAME product_id!
             "category": "fashion",
-            "_vectors": {"default": [0.9, 0.9]} // High vector similarity to search vector
+            "_vectors": {"default": [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]} // Extreme high similarity
         },
         {
             "id": 3,
-            "title": "Different product entirely",
-            "brand": "Adidas",
+            "title": "Different product entirely unrelated content",
+            "brand": "Puma",
             "product_id": "DIFFERENT_PRODUCT",
             "category": "other",
-            "_vectors": {"default": [0.5, 0.5]}
+            "_vectors": {"default": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]}
         }
     ]);
 
@@ -686,11 +686,11 @@ async fn test_hybrid_search_distinct_bug_reproduction() {
     let (task, _) = index.update_distinct_attribute(json!("product_id")).await;
     index.wait_task(task.uid()).await.succeeded();
 
-    // Search that should favor document 1 for keywords and document 2 for vectors
+    // Search with query that strongly favors doc 1 for keywords and doc 2 for vectors
     let (response, code) = index
         .search_post(json!({
-            "q": "NIKE SPORTS JACKET LEATHER RED",  // Should strongly match doc 1
-            "vector": [0.9, 0.9],  // Should strongly match doc 2
+            "q": "red nike running shoes",  // Should only match document 1 well
+            "vector": [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0],  // Should only match document 2 well
             "hybrid": {
                 "embedder": "default", 
                 "semanticRatio": 0.5  // Equal weight to both searches
@@ -721,10 +721,10 @@ async fn test_hybrid_search_distinct_bug_reproduction() {
     
     println!("Product ID counts: {:?}", product_id_counts);
     
-    // Check if SAME_PRODUCT appears more than once - this would be the bug
-    if let Some(&count) = product_id_counts.get("SAME_PRODUCT") {
+    // Check if DUPLICATE_ID appears more than once - this would be the bug
+    if let Some(&count) = product_id_counts.get("DUPLICATE_ID") {
         if count > 1 {
-            panic!("BUG REPRODUCED! product_id 'SAME_PRODUCT' appears {} times in hybrid search results, violating distinct constraint", count);
+            panic!("BUG REPRODUCED! product_id 'DUPLICATE_ID' appears {} times in hybrid search results, violating distinct constraint", count);
         }
     }
     
@@ -736,13 +736,13 @@ async fn test_hybrid_distinct_bug_extreme() {
     let server = Server::new().await;
     let index = server.index("test");
 
-    // Set up embedder
+    // Set up embedder with higher dimensions for more extreme differences
     let (response, code) = index
         .update_settings(json!({ 
             "embedders": {
                 "default": {
                     "source": "userProvided",
-                    "dimensions": 2
+                    "dimensions": 8  // Increased from 2 to 8 dimensions
                 }
             }
         }))
@@ -750,19 +750,19 @@ async fn test_hybrid_distinct_bug_extreme() {
     assert_eq!(202, code);
     index.wait_task(response.uid()).await.succeeded();
 
-    // Documents with IDENTICAL distinct values that should appear in BOTH searches
+    // Documents with IDENTICAL distinct values but extreme content differences
     let test_documents = json!([
         {
             "id": 1,
-            "title": "red shoes nike",  // Should match keyword search well
+            "title": "red nike running shoes athletic footwear",  // Strong keyword match
             "product_id": "DUPLICATE_PRODUCT_ID",
-            "_vectors": {"default": [0.0, 0.0]}  // Low similarity to search vector
+            "_vectors": {"default": [-1.0, -1.0, -1.0, -1.0, -1.0, -1.0, -1.0, -1.0]}  // Extreme low similarity
         },
         {
             "id": 2,
-            "title": "green shirt adidas",  // Different content
+            "title": "blue adidas casual shirt clothing apparel",  // Completely different keywords
             "product_id": "DUPLICATE_PRODUCT_ID",  // SAME product_id!
-            "_vectors": {"default": [1.0, 1.0]}   // High similarity to search vector
+            "_vectors": {"default": [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]}   // Extreme high similarity
         }
     ]);
 
@@ -777,8 +777,8 @@ async fn test_hybrid_distinct_bug_extreme() {
     // Hybrid search - should trigger both vector and keyword search
     let (response, code) = index
         .search_post(json!({
-            "q": "red shoes nike",      // Should rank doc 1 high in keyword search
-            "vector": [1.0, 1.0],       // Should rank doc 2 high in vector search  
+            "q": "red nike running shoes",      // Should only match doc 1 well in keyword search
+            "vector": [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0],       // Should only match doc 2 well in vector search  
             "hybrid": {
                 "embedder": "default", 
                 "semanticRatio": 0.5
