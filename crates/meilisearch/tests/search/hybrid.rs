@@ -2,7 +2,7 @@ use meili_snap::snapshot;
 use once_cell::sync::Lazy;
 
 use crate::common::index::Index;
-use crate::common::{Server, Value};
+use crate::common::{GetAllDocumentsOptions, Server, Value};
 use crate::json;
 
 async fn index_with_documents_user_provided<'a>(
@@ -624,4 +624,328 @@ async fn retrieve_vectors() {
       }
     ]
     "###);
+}
+
+// Let's modify the test to be more explicit about reproducing the bug
+#[actix_rt::test]
+async fn test_hybrid_search_distinct_bug_reproduction() {
+    use std::collections::HashSet;
+    
+    let server = Server::new().await;
+    let index = server.index("test");
+
+    // Set up embedder with higher dimensions for more extreme differences
+    let (response, code) = index
+        .update_settings(json!({ 
+            "embedders": {
+                "default": {
+                    "source": "userProvided",
+                    "dimensions": 8  // Increased from 2 to 8 dimensions
+                }
+            }
+        }))
+        .await;
+    assert_eq!(202, code);
+    index.wait_task(response.uid()).await.succeeded();
+
+    // Create documents with extreme differences:
+    // - Completely different content for keyword vs vector optimization
+    // - More extreme vector differences using 8D space
+    let test_documents = json!([
+        {
+            "id": 1,
+            "title": "red nike running shoes athletic footwear",  // Strong keyword match
+            "brand": "Nike", 
+            "product_id": "DUPLICATE_ID",
+            "category": "sports",
+            "_vectors": {"default": [-1.0, -1.0, -1.0, -1.0, -1.0, -1.0, -1.0, -1.0]}  // Extreme low similarity
+        },
+        {
+            "id": 2,
+            "title": "blue adidas casual shirt clothing apparel", // Completely different keywords
+            "brand": "Adidas",
+            "product_id": "DUPLICATE_ID", // SAME product_id!
+            "category": "fashion",
+            "_vectors": {"default": [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]} // Extreme high similarity
+        },
+        {
+            "id": 3,
+            "title": "Different product entirely unrelated content",
+            "brand": "Puma",
+            "product_id": "DIFFERENT_PRODUCT",
+            "category": "other",
+            "_vectors": {"default": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]}
+        }
+    ]);
+
+    let (response, code) = index.add_documents(test_documents, Some("id")).await;
+    assert_eq!(202, code);
+    index.wait_task(response.uid()).await.succeeded();
+
+    // Set distinct on product_id
+    let (task, _) = index.update_distinct_attribute(json!("product_id")).await;
+    index.wait_task(task.uid()).await.succeeded();
+
+    // Search with query that strongly favors doc 1 for keywords and doc 2 for vectors
+    let (response, code) = index
+        .search_post(json!({
+            "q": "red nike running shoes",  // Should only match document 1 well
+            "vector": [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0],  // Should only match document 2 well
+            "hybrid": {
+                "embedder": "default", 
+                "semanticRatio": 0.5  // Equal weight to both searches
+            },
+            "limit": 10
+        }))
+        .await;
+
+    assert_eq!(200, code);
+    let hits = response["hits"].as_array().unwrap();
+    
+    println!("Total hits: {}", hits.len());
+    for (i, hit) in hits.iter().enumerate() {
+        println!("Hit {}: id={}, product_id={}, title={}", 
+                i, 
+                hit["id"], 
+                hit["product_id"], 
+                hit["title"]);
+    }
+    
+    // Count occurrences of each product_id
+    let mut product_id_counts = std::collections::HashMap::new();
+    for hit in hits {
+        if let Some(product_id) = hit["product_id"].as_str() {
+            *product_id_counts.entry(product_id).or_insert(0) += 1;
+        }
+    }
+    
+    println!("Product ID counts: {:?}", product_id_counts);
+    
+    // Check if DUPLICATE_ID appears more than once - this would be the bug
+    if let Some(&count) = product_id_counts.get("DUPLICATE_ID") {
+        if count > 1 {
+            panic!("BUG REPRODUCED! product_id 'DUPLICATE_ID' appears {} times in hybrid search results, violating distinct constraint", count);
+        }
+    }
+    
+    println!("Distinct filtering appears to be working correctly");
+}
+
+#[actix_rt::test]
+async fn test_hybrid_distinct_bug_extreme() {
+    let server = Server::new().await;
+    let index = server.index("test");
+
+    // Set up embedder with higher dimensions for more extreme differences
+    let (response, code) = index
+        .update_settings(json!({ 
+            "embedders": {
+                "default": {
+                    "source": "userProvided",
+                    "dimensions": 8  // Increased from 2 to 8 dimensions
+                }
+            }
+        }))
+        .await;
+    assert_eq!(202, code);
+    index.wait_task(response.uid()).await.succeeded();
+
+    // Documents with IDENTICAL distinct values but extreme content differences
+    let test_documents = json!([
+        {
+            "id": 1,
+            "title": "red nike running shoes athletic footwear",  // Strong keyword match
+            "product_id": "DUPLICATE_PRODUCT_ID",
+            "_vectors": {"default": [-1.0, -1.0, -1.0, -1.0, -1.0, -1.0, -1.0, -1.0]}  // Extreme low similarity
+        },
+        {
+            "id": 2,
+            "title": "blue adidas casual shirt clothing apparel",  // Completely different keywords
+            "product_id": "DUPLICATE_PRODUCT_ID",  // SAME product_id!
+            "_vectors": {"default": [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]}   // Extreme high similarity
+        }
+    ]);
+
+    let (response, code) = index.add_documents(test_documents, Some("id")).await;
+    assert_eq!(202, code);
+    index.wait_task(response.uid()).await.succeeded();
+
+    // Set distinct on product_id
+    let (task, _) = index.update_distinct_attribute(json!("product_id")).await;
+    index.wait_task(task.uid()).await.succeeded();
+
+    // Hybrid search - should trigger both vector and keyword search
+    let (response, code) = index
+        .search_post(json!({
+            "q": "red nike running shoes",      // Should only match doc 1 well in keyword search
+            "vector": [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0],       // Should only match doc 2 well in vector search  
+            "hybrid": {
+                "embedder": "default", 
+                "semanticRatio": 0.5
+            },
+            "limit": 10
+        }))
+        .await;
+
+    assert_eq!(200, code);
+    let hits = response["hits"].as_array().unwrap();
+    
+    println!("SEARCH RESULTS:");
+    for (i, hit) in hits.iter().enumerate() {
+        println!("  Hit {}: id={}, product_id={}", i, hit["id"], hit["product_id"]);
+    }
+    
+    // Check for duplicate product_ids - THIS IS THE BUG
+    let product_ids: Vec<&str> = hits.iter()
+        .filter_map(|hit| hit["product_id"].as_str())
+        .collect();
+    
+    let unique_count = product_ids.iter().collect::<std::collections::HashSet<_>>().len();
+    
+    if product_ids.len() > unique_count {
+        panic!("BUG REPRODUCED! Found {} total results but only {} unique product_ids. \
+               This means distinct filtering failed in hybrid search! Results: {:?}", 
+               product_ids.len(), unique_count, product_ids);
+    }
+    
+    // If only one result, distinct filtering worked (but we hoped to reproduce the bug)
+    if hits.len() == 1 {
+        println!("Only one result returned - distinct filtering working or different issue");
+    } else {
+        println!("Multiple results with unique product_ids - distinct filtering appears to work");
+    }
+}
+
+#[actix_rt::test]
+async fn test_distinct_filtering_with_federated_search() {
+    let server = Server::new().await;
+    
+    // Create two indexes
+    let products_index = server.index("products");
+    let categories_index = server.index("categories");
+
+    // Set up embedder for both indexes
+    for index in [&products_index, &categories_index] {
+        let (response, code) = index
+            .update_settings(json!({ 
+                "embedders": {
+                    "default": {
+                        "source": "userProvided",
+                        "dimensions": 2
+                    }
+                }
+            }))
+            .await;
+        assert_eq!(202, code);
+        index.wait_task(response.uid()).await.succeeded();
+    }
+
+    // Add documents to products index
+    let products_documents = json!([
+        {
+            "id": 1,
+            "title": "Red Nike Shoes",
+            "product_id": "ABC123",
+            "_vectors": {"default": [0.1, 0.1]}
+        }
+    ]);
+
+    let (response, code) = products_index.add_documents(products_documents, Some("id")).await;
+    assert_eq!(202, code);
+    products_index.wait_task(response.uid()).await.succeeded();
+
+    // Add documents to categories index
+    let categories_documents = json!([
+        {
+            "id": 1,
+            "name": "Nike Shoes",
+            "category_id": "ABC123",  // Same ID as the product!
+            "_vectors": {"default": [0.9, 0.9]}
+        }
+    ]);
+
+    let (response, code) = categories_index.add_documents(categories_documents, Some("id")).await;
+    assert_eq!(202, code);
+    categories_index.wait_task(response.uid()).await.succeeded();
+
+    // Set distinct attributes for both indexes
+    for index in [&products_index, &categories_index] {
+        let (task, _) = index.update_distinct_attribute(json!("product_id")).await;
+        index.wait_task(task.uid()).await.succeeded();
+    }
+
+    // Perform federated search
+    let (response, code) = server
+        .multi_search(json!({
+            "federation": {},  // Enable federation
+            "queries": [
+                {
+                    "indexUid": "products",
+                    "q": "red shoes",
+                    "vector": [0.9, 0.9],
+                    "hybrid": {
+                        "embedder": "default",
+                        "semanticRatio": 0.5
+                    }
+                },
+                {
+                    "indexUid": "categories",
+                    "q": "red shoes",
+                    "vector": [0.9, 0.9],
+                    "hybrid": {
+                        "embedder": "default",
+                        "semanticRatio": 0.5
+                    }
+                }
+            ]
+        }))
+        .await;
+    assert_eq!(200, code);
+    
+    // Check results from federated search
+    let hits = response["hits"].as_array().unwrap();
+    
+    println!("\nFEDERATED SEARCH RESULTS:");
+    for (i, hit) in hits.iter().enumerate() {
+        println!("  {}. id={}, index={}, federation={}", 
+                i+1, 
+                hit["id"], 
+                hit["_federation"]["indexUid"],
+                hit["_federation"]);
+    }
+    
+    // Collect all distinct values
+    let mut all_distinct_values = Vec::new();
+    
+    // Add product_ids from products index
+    for hit in hits {
+        if let Some(product_id) = hit["product_id"].as_str() {
+            all_distinct_values.push(product_id);
+        }
+        if let Some(category_id) = hit["category_id"].as_str() {
+            all_distinct_values.push(category_id);
+        }
+    }
+    
+    let unique_distinct_values: std::collections::HashSet<_> = all_distinct_values.iter().collect();
+    
+    println!("\nTotal results: {}, Unique distinct values: {}", 
+             all_distinct_values.len(), 
+             unique_distinct_values.len());
+    println!("Distinct values found: {:?}", all_distinct_values);
+    
+    // The bug would manifest as having more results than unique distinct values
+    if all_distinct_values.len() > unique_distinct_values.len() {
+        panic!("BUG REPRODUCED! Federated search returned {} documents but only {} unique distinct values. \
+               This proves distinct filtering is not applied after merging results from different indexes. \
+               Distinct values: {:?}", 
+               all_distinct_values.len(), 
+               unique_distinct_values.len(), 
+               all_distinct_values);
+    }
+    
+    println!("\nTest completed. Expected 1 unique distinct value, got {}", unique_distinct_values.len());
+    if unique_distinct_values.len() == 1 {
+        println!("Distinct filtering appears to be working correctly in this version");
+    }
 }
