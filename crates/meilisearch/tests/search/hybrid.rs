@@ -625,3 +625,109 @@ async fn retrieve_vectors() {
     ]
     "###);
 }
+// Test for hybrid search distinct bug
+static DOCUMENTS_WITH_DUPLICATES: Lazy<Value> = Lazy::new(|| {
+    json!([
+        {
+            "title": "Captain Marvel",
+            "desc": "First Captain Marvel movie",
+            "id": "1",
+            "category": "superhero",
+            "_vectors": {"default": [1.0, 2.0]},
+        },
+        {
+            "title": "Captain Marvel Returns",
+            "desc": "Second Captain Marvel movie",
+            "id": "2", 
+            "category": "superhero",
+            "_vectors": {"default": [1.1, 2.1]},
+        },
+        {
+            "title": "Shazam!",
+            "desc": "DC's Captain Marvel",
+            "id": "3",
+            "category": "superhero", 
+            "_vectors": {"default": [2.0, 3.0]},
+        },
+        {
+            "title": "Iron Man",
+            "desc": "Tony Stark's story",
+            "id": "4",
+            "category": "action",
+            "_vectors": {"default": [3.0, 1.0]},
+        }
+    ])
+});
+
+async fn index_with_distinct_and_vectors<'a>(
+    server: &'a Server,
+    documents: &Value,
+) -> Index<'a> {
+    let index = server.index("test");
+
+    // Set up embedders
+    let (response, code) = index
+        .update_settings(json!({ 
+            "embedders": {"default": {
+                "source": "userProvided",
+                "dimensions": 2
+            }},
+            "distinctAttribute": "category"
+        }))
+        .await;
+    assert_eq!(202, code, "{:?}", response);
+    index.wait_task(response.uid()).await.succeeded();
+
+    // Add documents
+    let (response, code) = index.add_documents(documents.clone(), None).await;
+    assert_eq!(202, code, "{:?}", response);
+    index.wait_task(response.uid()).await.succeeded();
+    
+    index
+}
+
+#[actix_rt::test]
+async fn test_hybrid_search_respects_distinct_attribute() {
+    let server = Server::new().await;
+    let index = index_with_distinct_and_vectors(&server, &DOCUMENTS_WITH_DUPLICATES).await;
+
+    // First test: pure keyword search with distinct - should only return 2 documents (one per category)
+    let (response, code) = index
+        .search_post(
+            json!({"q": "Captain", "showRankingScore": true}),
+        )
+        .await;
+    snapshot!(code, @"200 OK");
+    // Should only return 2 hits: one from "superhero" category and one from "action" category
+    // But due to the bug, it returns more than expected
+    let keyword_hits = response["hits"].as_array().unwrap().len();
+    println!("Keyword search hits: {}", keyword_hits);
+    
+    // Now test: hybrid search with distinct - this should also respect the distinct constraint
+    let (response, code) = index
+        .search_post(
+            json!({
+                "q": "Captain", 
+                "vector": [1.5, 2.5], 
+                "hybrid": {"semanticRatio": 0.5, "embedder": "default"}, 
+                "showRankingScore": true
+            }),
+        )
+        .await;
+    snapshot!(code, @"200 OK");
+    
+    let hybrid_hits = response["hits"].as_array().unwrap().len();
+    println!("Hybrid search hits: {}", hybrid_hits);
+    
+    // Check that we only get one document per distinct category
+    let mut categories_seen = std::collections::HashSet::new();
+    for hit in response["hits"].as_array().unwrap() {
+        let category = hit["category"].as_str().unwrap();
+        assert!(!categories_seen.contains(category), 
+               "Duplicate category '{}' found in hybrid search results - distinct constraint violated!", category);
+        categories_seen.insert(category);
+    }
+    
+    // This assertion will fail due to the bug - hybrid search ignores distinct constraint
+    assert!(hybrid_hits <= 2, "Hybrid search should respect distinct constraint and return at most 2 documents (one per category), but got {}", hybrid_hits);
+}
